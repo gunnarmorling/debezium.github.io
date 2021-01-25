@@ -1,0 +1,176 @@
+---
+layout: post
+title:  Saga Orchestration Using the Outbox Pattern
+date:   2021-01-27
+tags: [ discussion, patterns, outbox ]
+author: gmorling
+---
+
+When moving to microservices, one of the first things to realize is that individual services don't exist in isolation.
+While the aim is to create loosely coupled, independent services with as less interaction as possible,
+chances are high that one service needs a particular data set owned by another service,
+or that multiple services need to act in concert in order to achieve a consistent outcome of an operation in the domain of our business.
+
+The link:/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/[outbox pattern, implemented via change data capture], is a proven approach for addressing the concern of data exchange between microservices;
+Avoiding any unsafe "dual writes" to multiple resources, e.g. a database and a messaging broker,
+the outbox pattern achieves eventual consistent data exchange,
+without depending on the synchronous availability of all participants,
+and not requiring distributed transaction protocols such as 2PC either.
+
+In this post I'd like to explore how to take the outbox pattern to the next level and use it for implementing _sagas_,
+potentially long-running business transactions which span across multiple microservices.
+One common example is that of booking a travel comprising of multiple parts: either all flight legs and accommodation should be booked together, or none of them.
+Sagas split up one such overarching business transaction into a series of multiple local database transactions.
+
++++<!-- more -->+++
+
+For "rolling back" the overarching business transaction in case of a failure,
+sagas rely on the notion of _compensating transactions_:
+each previously applied local transaction must be able to be "undone" by running another transaction which applies the inversion of the formerly done changes.
+Sagas are by no means a new concept, they have first been discussed by Hector Garcia-Molina and Kenneth  Salem in their SIGMOD '87 https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf[Sagas] paper.
+But as distributed transactions typically are not an option in microservices architectures,
+sagas backed by local transactions within the participating services are seeing growing popularity these days.
+
+To make things tangible, let's consider the example of an e-commerce business with three services, _order_, _customer_, and _payment_.
+When a new purchase order is submitted to the _order_ service,
+the following flow should be executed, also including the other two services,
+which best is perceived as a state machine:
+
+[.centered-image.responsive-image]
+====
+++++
+<img src="/assets/images/saga/order-states.png" style="max-width:90%;" class="responsive-image" alt="Order state transitions">
+++++
+*Figure 1. Order state transitions*
+====
+
+First, we need to check with the _customer_ service whether the incoming order fits into the customer's credit limit
+(as we don't want to have pending orders of one customer pass a certain threshold).
+If this succeeds,
+the payment for the order needs to be requested via the _payment_ service.
+
+If the credit approval fails,
+the order will go to `Rejected` state right away.
+If that steps succeeds but then the subsequent payment request fails,
+the previously allocated credit limit needs to be released again,
+before transitioning to the `rejected` state.
+If credit approval and payment request succeed, the order transitions into `Accepted` state,
+so fulfillment for it could begin (which is not part of the process discussed here).
+
+== Implementation Choices
+
+Before diving into the implementation of this interaction flow,
+it's worth spending some time to think about the transactional semantics it provides.
+So let's examine the four classic ACID properties of transactions:
+
+* _**A** tomicity_: ✅ -- The pattern ensures that either all services apply the local transactions,
+or, in case of a failure, all already executed local transactions are compensated
+* _**C** onsistency_: ✅ -- All local constraints are guaranteed to be satisfied after successful execution of all the transactions making up the saga
+* _**I** solation_: ❌ -- As local transactions are committed as the saga is running, their changes are already visible to other concurrent transactions, despite the possibility that the saga will fail eventually,
+causing all transactions to be compensated. I.e. the isolation level is comparable to "read uncommitted"
+* _**D** urability_: ✅ -- Once the local transactions of the saga have been committed, their changes are persisted and durable e.g. after a service failure and restart
+
+From the perspective of the service consumer -- e.g. a user placing a purchase order with the _order_ service -- the system behaves eventually consistent;
+i.e. after the `placeOrder()` call returns, it will take some time until the purchase order is in its correct state,
+as per the logic of the different participating services.
+
+There are two general ways for implementing distributed sagas, _choreography_ and _orchestration_.
+In the choreography approach, one participating service sends a message to the next after it has executed its local transaction.
+With orchestration on the other hand, there's one coordinating service, which invokes one participant after the other
+(either synchronously, e.g. via HTTP or gRPC, or (preferably) asynchronously, e.g. via message brokers or distributed logs such as Apache Kafka).
+
+Both approaches have their pros and cons, e.g. see https://chrisrichardson.net/post/sagas/2019/08/04/developing-sagas-part-2.html[this post] by Chris Richardson for a more detailed discussion.
+Personally, I'm preferring the orchestration approach, as it defines one central place which can be queried to obtain the current status of a particular saga (the orchestrator, or "saga execution coordinator", SEC for short).
+Also it allows to add additional intermediary steps between two participants of the flow,
+without the need to adjust them.
+
+== Recap: The Outbox Pattern
+
+Now, how do the outbox pattern and change data capture (via Debezium, of course) fit into all this?
+As said above, a saga coordinator should preferably communicate asynchronously with participating services,
+via request and reply message channels.
+Apache Kafka is a super-popular choice for implementing these channels.
+But the orchestrator (and each participating service) also need to apply transactions to their specific databases in order to execute their parts of the overall saga flow.
+
+While it might be tempting to simply execute a database transaction and send a corresponding message to Kafka shortly thereafter, this is not a good idea.
+These two actions would not happen within a single transaction spanning the database and Kafka,
+so it's only matter of time until we end up with an inconsistent state, when e.g. the database transaction commits but the write to Kafka fails.
+But friends don't let friends do dual writes, and the outbox pattern is a very elegant way for addressing this issue:
+
+[.centered-image.responsive-image]
+====
+++++
+<img src="/assets/images/saga/outbox-pattern.png" style="max-width:90%;" class="responsive-image" alt="Safely updating the database and sending a message to Kafka via the outbox pattern">
+++++
+*Figure 2. Safely updating the database and sending a message to Kafka via the outbox pattern*
+====
+
+Instead of directly sending a message to Kafka when updating the database,
+the service inserts the message into a specific _outbox table_ within its database.
+This happens within a shared transaction, so either the changes to the service's model are persisted _and_ the message gets safely stored in the outbox table,
+or _none_ of these changes gets applied.
+Once the transaction has been written to the database's transaction log,
+the Debezium change data capture process can pick up the outbox message from there and be sent to Apache Kafka.
+
+This is done using _at-least-once_ semantics, i.e. it might happen the same outbox message is sent to Kafka multiple times.
+This would happen in case of failures such as a crash of Debezium,
+where it didn't get to persist its offset, i.e. the last log position it has read.
+After a restart, it would then continue to read the transaction log from the last persisted offset position,
+resulting in messages after that offset potentially being sent a second time.
+In order to allow consumers to detect and ignore duplicated messages,
+each message should have a unique id,
+which e.g. in case of Debezium's Quarkus extension for sending outbox messages is a UUID that gets propagated as a Kafka message header.
+
+== Implementing Sagas Using the Outbox Pattern
+
+With the outbox pattern in our toolbox, things become a bit clearer;
+the _order_ service, acting as the saga coordinator, triggers the entire flow after an incoming `placeOrder()` call, typically via a REST API,
+by updating its own local state - comprising of the persisted order model and the saga execution log - and emitting a message to the first participating service, _customer_.
+Each saga participant reacts to messages which it receives via Kafka,
+performs a local transaction which updates its own data state and emits a reply message for coordinator via its own outbox table.
+
+The overall design looks like this:
+
+[.centered-image.responsive-image]
+====
+++++
+<img src="/assets/images/saga/saga-with-outbox.png" style="max-width:90%;" class="responsive-image" alt="Saga orchestration using the outbox pattern">
+++++
+*Figure 3. Saga orchestration using the outbox pattern*
+====
+
+Compared to synchronous communication e.g. via HTTP, implementing the Saga flow via the outbox pattern, CDC and Kafka allows the participants to be nicely decoupled.
+If for instance the _customer_ service isn't up an running when the _order_ service receives a new purchase order,
+this doesn't matter at all.
+The same goes for Kafka or Debezium, the only resource required synchronously by the _order_ service is its own database.
+Once components come back up again, they will pick up from the last committed offset and continue the data flow.
+
+
+
+== Failure Scenarios
+
+
+
+[source,xml]
+----
+<dependency>
+  <groupId>io.debezium</groupId>
+  <artifactId>debezium-testing-testcontainers</artifactId>
+  <version>1.1.0.CR1</version>
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>org.testcontainers</groupId>
+  <artifactId>kafka</artifactId>
+  <scope>test</scope>
+</dependency>
+----
+
+
+== Wrap-Up
+
+Kogito
+microprofile lra
+optimistic locking
+parallelization
+no local rollback, *must* commit outbox message
