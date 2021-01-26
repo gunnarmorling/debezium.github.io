@@ -147,10 +147,8 @@ The overall design looks like this:
 You can find an example implementation of this architecture in the Debezium examples repository on GitHub.
 The key parts of the architecture are these:
 
-* The three services, _order_, _customer_, and _payment_, each with their own local database (Postgres);
-they are implemented using the Quarkus stack and Debezium's Quarkus extension for persisting outbox messages;
-the _order_ service implements the orchestration logic for the saga
-(in form of a simple state machine) and the saga execution log, which will be discussed in more depth further below
+* The three services, _order_ (for managing purchase orders and acting as the saga orchestrator), _customer_ (for managing the customer's credit limit), and _payment_ (for handling credit card payments), each with their own local database (Postgres);
+they are implemented using the https://quarkus.io/[Quarkus] stack
 * Apache Kafka as the messaging backbone
 * Debezium, running on top of Kafka Connect, subscribing to changes in the three different databases, and sending them to corresponding Kafka topics, using Debezium's outbox event routing SMT
 
@@ -175,9 +173,11 @@ in order to better understand how messages flow between the different saga parti
 If for instance the payment step would fail (the customer's credit card has expired),...
 
 
-Having discussed the message flow _between_ services, let's take a look into the _order_ service,
-examining some key parts of its implementation.
-The current state of the saga execution is tracked within the `sagastate` table, whose schema looks like this:
+Having discussed the message flow _between_ services, let's now dive into some implementation details, starting with the _order_ service.
+The example implementation provides a generic saga orchestrator in form of a simple state machine and the order-specific saga implementation,
+which will be discussed in more depth further below.
+The "framework" part of the _order_ service's implementation keeps track of the current state of the saga execution within the `sagastate` table,
+whose schema looks like this:
 
 [source]
 ----
@@ -202,7 +202,10 @@ Its columns are these:
 * `type`: A nominal type of a saga, e.g. "order-placement"; useful to tell apart different kinds of sagas supported by one system
 * `version`: An optimistic locking version, used to detect and reject concurrent updates to one saga instance (in which case the message triggering the failing update needs to be retried, re-loading the current state from the saga log)
 
+As the _order_ services sends requests to the _customer_ and _payment_ services and receives their replies from Kafka,
+the saga state gets updated within this table.
 By setting up a Debezium connector for tracking the `sagastate` table, we can nicely examine the progress of a saga's execution in Kafka.
+
 Here's the state transitions for a purchase order whose payment fails;
 First, the order comes in and the "credit-approval" step gets started:
 
@@ -298,25 +301,245 @@ Finally, both steps as well as the entire saga instance are in the `ABORTED` sta
 
 You can try out things yourself by following instructions in the example's README file,
 where you'll find requests for placing successful as well as failing order creations.
+It also has instructions for examining the exchanged messages in the Kafka topics sourced from the outbox tables of the different services.
 
+The saga flow gets started within the _order_ service's REST endpoint implementation like so:
 
-== Failure Scenarios
+[source,java]
+----
+@POST
+@Transactional
+public PlaceOrderResponse placeOrder(PlaceOrderRequest req) {
+    PurchaseOrder order = req.toPurchaseOrder();
+    order.persist(); // <1>
+
+    sagaManager.begin(OrderPlacementSaga.class, OrderPlacementSaga.payloadFor(order)); // <2>
+
+    return PlaceOrderResponse.fromPurchaseOrder(order);
+}
+----
+<1> Persist the incoming purchase order
+<2> Begin the order placement saga flow for the incoming order
+
+`SagaManager#begin()` will create a new record in the `sagastate` table, obtain the first outbox event from the `OrderPlacementSaga` implementation and persist it in the outbox table.
+
+`OrderPlacementSaga` implements all the use case specific parts of the saga flow:
+
+* outbox events to be sent for executing one part of the saga flow
+* outbox events for compensating one part of the saga flow
+* event handlers for processing reply messages from the othe saga participants
+
+The `OrderPlacementSaga` implementation is a tad too long for showing it here in its entirety
+(you can find its complete source here on GitHub),
+but here are some key parts:
+
+[source,java]
+----
+@Saga(type="order-placement", stepIds = {CREDIT_APPROVAL, PAYMENT}) // <1>
+public class OrderPlacementSaga extends SagaBase {
+
+  private static final String REQUEST = "REQUEST";
+  private static final String CANCEL = "CANCEL";
+  protected static final String PAYMENT = "payment";
+  protected static final String CREDIT_APPROVAL = "credit-approval";
+
+  // ...
+
+  @Override
+  public SagaStepMessage getStepMessage(String id) { // <2>
+    if (id.equals(PAYMENT)) {
+      return new SagaStepMessage(PAYMENT, REQUEST, getPayload());
+    }
+    else {
+      return new SagaStepMessage(CREDIT_APPROVAL, REQUEST, getPayload());
+    }
+  }
+
+  @Override
+  public SagaStepMessage getCompensatingStepMessage(String id) { // <3>
+    // ...
+  }
+
+  public void onPaymentEvent(PaymentEvent event) { // <4>
+    if (alreadyProcessed(event.messageId)) {
+      return;
+    }
+
+    onStepEvent(PAYMENT, event.status.toStepStatus());
+    updateOrderStatus();
+
+    processed(event.messageId);
+  }
+
+  public void onCreditApprovalEvent(CreditApprovalEvent event) { // <5>
+     // ...
+  }
+
+  private void updateOrderStatus() { // <6>
+    if (getStatus() == SagaStatus.COMPLETED) {
+      PurchaseOrder order = PurchaseOrder.findById(getOrderId());
+      order.status = PurchaseOrderStatus.ACCEPTED;
+    }
+    else if (getStatus() == SagaStatus.ABORTED) {
+      PurchaseOrder order = PurchaseOrder.findById(getOrderId());
+      order.status = PurchaseOrderStatus.CANCELLED;
+    }
+  }
+
+  // ...
+}
+----
+<1> The ids of the saga steps in order of execution
+<2> Returns the outbox message to be emitted for the given step
+<3> Returns the outbox message to be emitted for compensating the given step
+<4> Event handler for "payment" reply messages; it will update the purchase order status as well as the saga status (via the `onStepEvent()` callback),
+which depending on the status may either complete the saga or initiate its rollback by applying all the compensating messages
+<5> Event handler for "credit approval" reply messages
+<6> Updates the purchase order status, based on the current saga states
+
+To simplify interactions with the respective outbox tables, the three services use Debezium's link:/documentation/reference/integrations/outbox.html[Quarkus extension] for persisting outbox messages.
+This extension allows to emit outbox events by firing CDI events,
+whose payload is persisted in the outbox table as part of the ongoing local database transaction:
+
+[source,java]
+----
+...
+this.outboxEvent.fire(CreditEvent.of(sagaId, CreditStatus.CANCELLED));
+...
+----
+
+Each service also has a journal table with the ids of consumed messages,
+allowing to identify and exclude duplicated messages after an un-clean connector shutdown.
+
+The implementation of the _customer_ and _payment_ services isn't anything fundamentally now,
+so they are omitted here for the sake of brevity.
+You can find their complete source code here.
+
+== When Things Go Wrong
+
+A key part of implementing distributed interaction patterns like sagas is understanding how they behave in failure scenarios and making sure that (eventual) consistency is also achieved under such unforeseen circumstances.
+
+Note that a negative outcome by any of the saga participants (e.g. if the _payment_ service rejects the payment due to an invalid credit card) is not a failure scenario here;
+it is explicitly expected that participants cannot successfully execute their part of the overall flow,
+resulting in the execution of appropriate compensating local transactions.
+This also means that such generally anticipated failure of execution must not result in a rollback of the local database transaction,
+as otherwise no reply message would be sent back to the orchestrator via the outbox.
+
+With that in mind, let's discuss some actual failure scenarios:
+
+The event handler of a Kafka message raises an exception:: the local database transaction will be rolled back and the incoming Kafka message will not be acknowledged with the broker; depending on the kind of exception, it may be retried after some time. In any case, monitoring should be in place to detect this situation, as the saga flow won't be able to continue until the message has been processed
+The Debezium connector crashes after sending an outbox message to Kafka, but before committing the offset in the source database's transaction log:: After restarting the connector, it will continue to read the messages from the outbox table beginning at the log offset that was committed last, potentially resulting in some outbox events sent a second time; that's why all the participants need to be idempotent, as implemented in the example by means of journal tables which allow to detect if the same event is processed a second time
+The Kafka broker isn't running or cannot be reached, e.g. due to a network split:: The Debezium connectors can resume their work once Kafka is available and accessable again; until then, saga flows naturally cannot proceed
+A message gets processed, but acknowledging it with Kafka fails:: The message will be passed to the consuming service again, which would find the message's id in its journal table and thus ignore the duplicated message
+Concurrent updates to the saga state table when processing multiple saga steps in parallel:: While we've discussed a sequential flow with the orchestrator triggering participating services one after another, one might also envision a saga implementation which processes multiple steps in parallel. In this case,
+concurrently arriving reply messages may compete to update the saga state table. This situation would be detected via the optimistic locking implemented on that table, causing an event handler trying to commit an update based on a superseded version of the saga state to fail, rollback and retry
+
+We could discuss some more cases, but the general semantics of the overall design are those of an eventually consistent system with at-least-once guarantees.
 
 == Bonus: Distributed Tracing
 
+When designing an event flow between distributed systems, operational insight is a key aspect of making sure everything runs correctly and efficiently.
+Distributed tracing helps with that by collecting trace information from the individual systems that contribute to such interaction and allowing to examine the call flows e.g. in a web UI.
 
+Debezium's outbox support addresses this concern through tight integration with the OpenTracing spec (support for OpenTelemetry is on the roadmap).
+By putting a tool such Jaeger into place, it's just a matter of configuration to collect trace information from the _order_, _customer_, and _payment_ services and display the end-to-end spans.
 
+[.centered-image.responsive-image]
+====
+++++
+<img src="/assets/images/saga/open-tracing.png" style="max-width:90%;" class="responsive-image" alt="Saga flow in the Jaeger UI">
+++++
+*Figure 5. Saga flow in the Jaeger UI*
+====
 
-
+The visualization flow in Jaeger nicely shows, how the saga flow is triggered by the incoming REST request in the _order_ service,
+an outbox message is sent to _customer_ and back to _order_,
+followed by another one sent to _payment_ and back to _order_.
+The tracing functionality makes it rather easy to identify unfinished flows
+-- e.g. because an event handler in one of the participating services fails to process a message --
+as well as performance bottlenecks,
+e.g. one event handler taking particularly long for fulfilling its part of the saga flow.
 
 == Wrap-Up
+
+The saga pattern is a very interesting option for implementing long-running "business transactions" which require multiple, separate services to agree on either applying or aborting a set of data changes.
+Where distributed transaction protocols like XA would have been a popular implementation choice in the past,
+they typically are not an option in microservices architectures.
+Services may use non-XA compatible data stores internally, Apache Kafka as a popular infrastructure for message exchange between microservices also doesn't support integration with XA transaction managers.
+
+Of course we should aspire for a service cut which doesn't require interaction with remote services in the first place.
+But depending on business requirements, the need for such interaction spanning multiple services may be impossible to avoid,
+in particular when it comes to integrating legacy systems or systems which are not under our control.
+
+
+
+
+On a related note it's critical to be aware of the implications of the limited isolation level of the overarching business transaction.
+For instance the allocation of parts of the customer's credit limit may cause another, concurrently submitted order by that customer, to be rejected, also if this first order eventually also would be rejected, e.g. due to a failure with its payment.
+bBut
 
 Kogito
 microprofile lra
 optimistic locking
 parallelization
-no local rollback, *must* commit outbox message
 how to deal with writes on pending objects
 systems must offer compensation facility
 ordering of outbox events
+dangling messages
 
+== Probably To be Left Out
+
+As an example, here is the event handler of the _customer_ service for processing the "credit approval" events:
+
+[source,java]
+----
+@ApplicationScoped
+@Traced
+public class CreditEventHandler {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(CreditEventHandler.class);
+
+    @Inject
+    MessageLog log;
+
+    @Inject
+    Event<ExportedEvent<?, ?>> outboxEvent;
+
+    @Transactional
+    public void onCreditEvent(UUID eventId, UUID sagaId, CreditLimitEvent event) {
+        if (log.alreadyProcessed(eventId)) { // <1>
+            LOGGER.info("Event with UUID {} was already retrieved, ignoring it", eventId);
+            return;
+        }
+
+        Customer customer = Customer.findById(event.customerId);
+
+        CreditStatus status;
+
+        if (event.type == CreditRequestType.REQUEST) {
+            if (customer.fitsCreditLimit(event.paymentDue)) { // <2>
+                status = CreditStatus.APPROVED;
+                customer.allocateCreditLimit(event.paymentDue);
+            }
+            else {
+                status = CreditStatus.REJECTED; // <3>
+            }
+        }
+        else {
+            customer.releaseCreditLimit(event.paymentDue); // <4>
+            status = CreditStatus.CANCELLED;
+        }
+
+        this.outboxEvent.fire(CreditEvent.of(sagaId, status)); // <5>
+
+        log.processed(eventId); // <6>
+    }
+ }
+----
+<1> Check whether the incoming message has been processed before; if so, abort
+<2> The incoming event represents a request to allocate the given order value within the customer's credit limit,
+which still is large enough to accomodate for that new purchase order
+<3> The purchase order of the incoming event would exceed the customer's credit limit, so the request needs to be rejected
+<4> The incoming order represents a compensation request for a previous limit allocation, so deduct the order value from the customer's limit
+<5> Emit an outbox event with the outcome of the transaction
+<6> Mark the message as processed in the journal
