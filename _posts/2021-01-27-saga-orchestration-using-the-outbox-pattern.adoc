@@ -45,8 +45,13 @@ which best is perceived as a state machine:
 ====
 
 First, we need to check with the _customer_ service whether the incoming order fits into the customer's credit limit
-(as we don't want to have pending orders of one customer pass a certain threshold).
-If this succeeds,
+(as we don't want to have pending orders of one customer to pass a certain threshold).
+So if for instance the customer has a credit limit of $500, and a new order with a value of $300 comes in,
+the remaining limit will be $200.
+A subsequent order with a value of $250 would be rejected accordingly,
+as it would pass the customer's current open credit limit.
+
+If the credit limit check succeeds,
 the payment for the order needs to be requested via the _payment_ service.
 
 If the credit approval fails,
@@ -58,6 +63,16 @@ If credit approval and payment request succeed, the order transitions into `Acce
 so fulfillment for it could begin (which is not part of the process discussed here).
 
 == Implementation Choices
+
+There are two general ways for implementing distributed sagas, _choreography_ and _orchestration_.
+In the choreography approach, one participating service sends a message to the next after it has executed its local transaction.
+With orchestration on the other hand, there's one coordinating service, which invokes one participant after the other
+(either synchronously, e.g. via HTTP or gRPC, or (preferably) asynchronously, e.g. via message brokers or distributed logs such as Apache Kafka).
+
+Both approaches have their pros and cons, e.g. see https://chrisrichardson.net/post/sagas/2019/08/04/developing-sagas-part-2.html[this post] by Chris Richardson for a more detailed discussion.
+Personally, I'm preferring the orchestration approach, as it defines one central place which can be queried to obtain the current status of a particular saga (the orchestrator, or "saga execution coordinator", SEC for short).
+Also it allows to add additional intermediary steps between two participants of the flow,
+without the need to adjust them.
 
 Before diving into the implementation of this interaction flow,
 it's worth spending some time to think about the transactional semantics it provides.
@@ -73,16 +88,6 @@ causing all transactions to be compensated. I.e. the isolation level is comparab
 From the perspective of the service consumer -- e.g. a user placing a purchase order with the _order_ service -- the system behaves eventually consistent;
 i.e. after the `placeOrder()` call returns, it will take some time until the purchase order is in its correct state,
 as per the logic of the different participating services.
-
-There are two general ways for implementing distributed sagas, _choreography_ and _orchestration_.
-In the choreography approach, one participating service sends a message to the next after it has executed its local transaction.
-With orchestration on the other hand, there's one coordinating service, which invokes one participant after the other
-(either synchronously, e.g. via HTTP or gRPC, or (preferably) asynchronously, e.g. via message brokers or distributed logs such as Apache Kafka).
-
-Both approaches have their pros and cons, e.g. see https://chrisrichardson.net/post/sagas/2019/08/04/developing-sagas-part-2.html[this post] by Chris Richardson for a more detailed discussion.
-Personally, I'm preferring the orchestration approach, as it defines one central place which can be queried to obtain the current status of a particular saga (the orchestrator, or "saga execution coordinator", SEC for short).
-Also it allows to add additional intermediary steps between two participants of the flow,
-without the need to adjust them.
 
 == Recap: The Outbox Pattern
 
@@ -126,8 +131,8 @@ which e.g. in case of Debezium's Quarkus extension for sending outbox messages i
 With the outbox pattern in our toolbox, things become a bit clearer;
 the _order_ service, acting as the saga coordinator, triggers the entire flow after an incoming `placeOrder()` call, typically via a REST API,
 by updating its own local state - comprising of the persisted order model and the saga execution log - and emitting a message to the first participating service, _customer_.
-Each saga participant reacts to messages which it receives via Kafka,
-performs a local transaction which updates its own data state and emits a reply message for coordinator via its own outbox table.
+The other two saga participants react to messages which they receive via Kafka,
+perform a local transaction which updates their own data state and emit a reply message for coordinator via their own outbox table.
 
 The overall design looks like this:
 
@@ -139,32 +144,169 @@ The overall design looks like this:
 *Figure 3. Saga orchestration using the outbox pattern*
 ====
 
+You can find an example implementation of this architecture in the Debezium examples repository on GitHub.
+The key parts of the architecture are these:
+
+* The three services, _order_, _customer_, and _payment_, each with their own local database (Postgres);
+they are implemented using the Quarkus stack and Debezium's Quarkus extension for persisting outbox messages;
+the _order_ service implements the orchestration logic for the saga
+(in form of a simple state machine) and the saga execution log, which will be discussed in more depth further below
+* Apache Kafka as the messaging backbone
+* Debezium, running on top of Kafka Connect, subscribing to changes in the three different databases, and sending them to corresponding Kafka topics, using Debezium's outbox event routing SMT
+
 Compared to synchronous communication e.g. via HTTP, implementing the Saga flow via the outbox pattern, CDC and Kafka allows the participants to be nicely decoupled.
 If for instance the _customer_ service isn't up an running when the _order_ service receives a new purchase order,
 this doesn't matter at all.
 The same goes for Kafka or Debezium, the only resource required synchronously by the _order_ service is its own database.
 Once components come back up again, they will pick up from the last committed offset and continue the data flow.
 
+Inspired by architecture documentation templates such as arc42, let's switch perspectives and take a look at the _runtime view_ of the solution,
+in order to better understand how messages flow between the different saga participants in case of a successful saga execution
+(and yes, I go carried away a bit in drawing diagrams using Excalidraw while writing this post ;):
+
+[.centered-image.responsive-image]
+====
+++++
+<img src="/assets/images/saga/saga-sequence.png" style="max-width:90%;" class="responsive-image" alt="Execution sequence of a successful saga flow">
+++++
+*Figure 4. Execution sequence of a successful saga flow*
+====
+
+If for instance the payment step would fail (the customer's credit card has expired),...
+
+
+Having discussed the message flow _between_ services, let's take a look into the _order_ service,
+examining some key parts of its implementation.
+The current state of the saga execution is tracked within the `sagastate` table, whose schema looks like this:
+
+[source]
+----
+Column      |     Type     | Modifiers
+------------+--------------+------------
+id          | uuid         | not null
+currentStep | varchar(255) |
+payload     | varchar(255) |
+status      | varchar(255) |
+stepState   | varchar(255) |
+type        | varchar(255) |
+version     | int4         | not null
+----
+
+Its columns are these:
+
+* `id`: Unique identifier of a given saga instance, representing the creation of one particular purchase order
+* `currentStep`: The step at which the saga currently is, e.g. "credit-approval" or "payment"
+* `payload`: An arbitrary data structure associated with a particular saga instance, e.g. containing the id or corresponding purchase order and other information useful during the saga lifecycle
+* `status`: The current status of the saga; one of `STARTED`, `SUCCEEDED`, `ABORTING`, or `ABORTED`
+* `stepState`: A string-ified JSON structure describing the status of the individual steps, e.g. `"{\"credit-approval\":\"SUCCEEDED\",\"payment\":\"STARTED\"}"`
+* `type`: A nominal type of a saga, e.g. "order-placement"; useful to tell apart different kinds of sagas supported by one system
+* `version`: An optimistic locking version, used to detect and reject concurrent updates to one saga instance (in which case the message triggering the failing update needs to be retried, re-loading the current state from the saga log)
+
+By setting up a Debezium connector for tracking the `sagastate` table, we can nicely examine the progress of a saga's execution in Kafka.
+Here's the state transitions for a purchase order whose payment fails;
+First, the order comes in and the "credit-approval" step gets started:
+
+[source,json]
+----
+{
+  "id": "17b572a2-cdc0-4501-8ec3-9eb2956b2b10",
+  "currentstep": null,
+  "payload": "{\"order-id\":2,\"customer-id\":456,\"payment-due\":4999,\"credit-card-no\":\"xxxx-yyyy-dddd-9999\"}",
+  "status": "STARTED",
+  "stepstate": "{}",
+  "type": "order-placement",
+  "version": 0
+}
+----
+
+[source,json]
+----
+{
+  "id": "17b572a2-cdc0-4501-8ec3-9eb2956b2b10",
+  "currentstep": "credit-approval",
+  "payload": "{\"order-id\":2,\"customer-id\":456, ...}",
+  "status": "STARTED",
+  "stepstate": "{\"credit-approval\":\"STARTED\"}",
+  "type": "order-placement",
+  "version": 1
+}
+----
+
+At this point, a "credit-approval" request message has been persisted in the outbox table, too.
+Once this has been sent to Kafka, the _customer_ service will process it and send a reply message.
+The _order_ services processes this by updating the saga state an starting the payment step:
+
+[source,json]
+----
+{
+  "id": "17b572a2-cdc0-4501-8ec3-9eb2956b2b10",
+  "currentstep": "payment",
+  "payload": "{\"order-id\":2,\"customer-id\":456, ...}",
+  "status": "STARTED",
+  "stepstate": "{\"credit-approval\":\"SUCCEEDED\",\"payment\":\"STARTED\"}",
+  "type": "order-placement",
+  "version": 2
+}
+----
+
+Again a message is sent via the outbox table, now the "payment" request.
+This fails, and the _payment_ system responds with a reply message indicating this fact.
+So the payment gets aborted:
+
+[source,json]
+----
+{
+  "id": "17b572a2-cdc0-4501-8ec3-9eb2956b2b10",
+  "currentstep": "payment",
+  "payload": "{\"order-id\":2,\"customer-id\":456, ...}",
+  "status": "ABORTING",
+  "stepstate": "{\"credit-approval\":\"SUCCEEDED\",\"payment\":\"ABORTING\"}",
+  "type": "order-placement",
+  "version": 3
+}
+----
+
+Once that has been confirmed by the _payment_ system, the "credit-approval" step needs to be compensated, too:
+
+[source,json]
+----
+{
+  "id": "17b572a2-cdc0-4501-8ec3-9eb2956b2b10",
+  "currentstep": "credit-approval",
+  "payload": "{\"order-id\":2,\"customer-id\":456, ...}",
+  "status": "ABORTING",
+  "stepstate": "{\"credit-approval\":\"ABORTING\",\"payment\":\"ABORTED\"}",
+  "type": "order-placement",
+  "version": 4
+}
+----
+
+Finally, both steps as well as the entire saga instance are in the `ABORTED` state:
+
+[source,json]
+----
+{
+  "id": "17b572a2-cdc0-4501-8ec3-9eb2956b2b10",
+  "currentstep": "credit-approval",
+  "payload": "{\"order-id\":2,\"customer-id\":456, ...}",
+  "status": "ABORTED",
+  "stepstate": "{\"credit-approval\":\"ABORTED\",\"payment\":\"ABORTED\"}",
+  "type": "order-placement",
+  "version": 5
+}
+----
+
+You can try out things yourself by following instructions in the example's README file,
+where you'll find requests for placing successful as well as failing order creations.
 
 
 == Failure Scenarios
 
+== Bonus: Distributed Tracing
 
 
-[source,xml]
-----
-<dependency>
-  <groupId>io.debezium</groupId>
-  <artifactId>debezium-testing-testcontainers</artifactId>
-  <version>1.1.0.CR1</version>
-  <scope>test</scope>
-</dependency>
-<dependency>
-  <groupId>org.testcontainers</groupId>
-  <artifactId>kafka</artifactId>
-  <scope>test</scope>
-</dependency>
-----
+
+
 
 
 == Wrap-Up
@@ -174,3 +316,7 @@ microprofile lra
 optimistic locking
 parallelization
 no local rollback, *must* commit outbox message
+how to deal with writes on pending objects
+systems must offer compensation facility
+ordering of outbox events
+
