@@ -7,7 +7,7 @@ author: gmorling
 ---
 
 When moving to microservices, one of the first things to realize is that individual services don't exist in isolation.
-While the aim is to create loosely coupled, independent services with as less interaction as possible,
+While the aim is to create loosely coupled, independent services with as little interaction as possible,
 chances are high that one service needs a particular data set owned by another service,
 or that multiple services need to act in concert in order to achieve a consistent outcome of an operation in the domain of our business.
 
@@ -19,7 +19,7 @@ and not requiring distributed transaction protocols such as 2PC either.
 
 In this post I'd like to explore how to take the outbox pattern to the next level and use it for implementing _sagas_,
 potentially long-running business transactions which span across multiple microservices.
-One common example is that of booking a travel comprising of multiple parts: either all flight legs and accommodation should be booked together, or none of them.
+One common example is that of booking a travel comprising multiple parts: either all flight legs and accommodation should be booked together, or none of them.
 Sagas split up one such overarching business transaction into a series of multiple local database transactions.
 
 +++<!-- more -->+++
@@ -55,8 +55,8 @@ If the credit limit check succeeds,
 the payment for the order needs to be requested via the _payment_ service.
 
 If the credit approval fails,
-the order will go to `Rejected` state right away.
-If that steps succeeds but then the subsequent payment request fails,
+the order will go to the `Rejected` state right away.
+If that step succeeds but then the subsequent payment request fails,
 the previously allocated credit limit needs to be released again,
 before transitioning to the `rejected` state.
 If credit approval and payment request succeed, the order transitions into `Accepted` state,
@@ -66,12 +66,12 @@ so fulfillment for it could begin (which is not part of the process discussed he
 
 There are two general ways for implementing distributed sagas, _choreography_ and _orchestration_.
 In the choreography approach, one participating service sends a message to the next after it has executed its local transaction.
-With orchestration on the other hand, there's one coordinating service, which invokes one participant after the other
-(either synchronously, e.g. via HTTP or gRPC, or (preferably) asynchronously, e.g. via message brokers or distributed logs such as Apache Kafka).
+With orchestration on the other hand, there's one coordinating service, which invokes one participant after the other.
 
-Both approaches have their pros and cons, e.g. see https://chrisrichardson.net/post/sagas/2019/08/04/developing-sagas-part-2.html[this post] by Chris Richardson for a more detailed discussion.
+Both approaches have their pros and cons, e.g. see https://chrisrichardson.net/post/sagas/2019/08/04/developing-sagas-part-2.html[this post] by Chris Richardson and https://medium.com/@ydorego/microservices-orchestration-vs-choreography-the-eternal-saga-d58c35e07d81[this one] by Yves do Régo for a more detailed discussion.
 Personally, I'm preferring the orchestration approach, as it defines one central place which can be queried to obtain the current status of a particular saga (the orchestrator, or "saga execution coordinator", SEC for short).
-Also it allows to add additional intermediary steps between two participants of the flow,
+As it avoids point-to-point communication between participants (other than the orchestrator),
+it also allows to add additional intermediary steps between two participants of the flow,
 without the need to adjust them.
 
 Before diving into the implementation of this interaction flow,
@@ -89,6 +89,16 @@ From the perspective of the service consumer -- e.g. a user placing a purchase o
 i.e. after the `placeOrder()` call returns, it will take some time until the purchase order is in its correct state,
 as per the logic of the different participating services.
 
+As far as the communication between the participating services is concerned,
+this may happen either synchronously, e.g. via HTTP or gRPC, or asynchronously, e.g. via message brokers or distributed logs such as Apache Kafka.
+While the former often is a popular choice due to its perceived simplicity,
+synchronous communication in distributed systems comes with quite a few disadvantages.
+A step in the saga flow will only complete if the target service is available at this point in time.
+While techniques like buffering or retrying requests may help, they are not without their own complexities.
+An asynchronous implementation e.g. via Kafka avoids these issues,
+as the availability of consuming services doesn't impact the sending service,
+and as we'll see in the next section, not even availability of Kafka itself is a concern, thanks to change data capture.
+
 == Recap: The Outbox Pattern
 
 Now, how do the outbox pattern and change data capture (via Debezium, of course) fit into all this?
@@ -99,7 +109,7 @@ But the orchestrator (and each participating service) also need to apply transac
 
 While it might be tempting to simply execute a database transaction and send a corresponding message to Kafka shortly thereafter, this is not a good idea.
 These two actions would not happen within a single transaction spanning the database and Kafka,
-so it's only matter of time until we end up with an inconsistent state, when e.g. the database transaction commits but the write to Kafka fails.
+so it's only a matter of time until we end up with an inconsistent state, when e.g. the database transaction commits but the write to Kafka fails.
 But friends don't let friends do dual writes, and the outbox pattern is a very elegant way for addressing this issue:
 
 [.centered-image.responsive-image]
@@ -190,7 +200,7 @@ From there, the messages are captured via Debezium and sent to Kafka, and finall
 
 Now, what happens if one step of the flow is failing?
 For instance let's assume the payment step fails, as the customer's credit card has expired.
-In that case, the previously reserved credit amount in the _customer_ service need to be released again.
+In that case, the previously reserved credit amount in the _customer_ service needs to be released again.
 To do so, the _order_ service sends a compensation request to the _customer_ service.
 Zooming out a bit (as the details around Debezium and Kafka are the same as before),
 this is how the message exchange would look like:
@@ -232,7 +242,7 @@ Its columns are these:
 * `type`: A nominal type of a saga, e.g. "order-placement"; useful to tell apart different kinds of sagas supported by one system
 * `version`: An optimistic locking version, used to detect and reject concurrent updates to one saga instance (in which case the message triggering the failing update needs to be retried, re-loading the current state from the saga log)
 
-As the _order_ services sends requests to the _customer_ and _payment_ services and receives their replies from Kafka,
+As the _order_ service sends requests to the _customer_ and _payment_ services and receives their replies from Kafka,
 the saga state gets updated within this table.
 By setting up a Debezium connector for tracking the `sagastate` table, we can nicely examine the progress of a saga's execution in Kafka.
 
@@ -267,7 +277,7 @@ First, the order comes in and the "credit-approval" step gets started:
 
 At this point, a "credit-approval" request message has been persisted in the outbox table, too.
 Once this has been sent to Kafka, the _customer_ service will process it and send a reply message.
-The _order_ services processes this by updating the saga state an starting the payment step:
+The _order_ services processes this by updating the saga state and starting the payment step:
 
 [source,json]
 ----
@@ -468,7 +478,7 @@ TODO: add step markers from earlier chart
 *Figure 6. Saga flow in the Jaeger UI*
 ====
 
-The visualization flow in Jaeger nicely shows, how the saga flow is triggered by the incoming REST request in the _order_ service,
+The visualization flow in Jaeger nicely shows how the saga flow is triggered by the incoming REST request in the _order_ service,
 an outbox message is sent to _customer_ and back to _order_,
 followed by another one sent to _payment_ and back to _order_.
 The tracing functionality makes it rather easy to identify unfinished flows
@@ -479,12 +489,12 @@ e.g. one event handler taking particularly long for fulfilling its part of the s
 == Wrap-Up
 
 Distributed transaction protocols like XA used to be a popular choice for applying changes to a set of databases.
-Within microservices architecures, this typically isn't an option, though.
+Within microservices architectures, this typically isn't an option, though.
 Services may use non-XA compatible data stores internally,
 also Apache Kafka -- as a popular infrastructure for message exchange between microservices -- doesn't support integration with XA transaction managers.
 
 The saga pattern presents itself as a very interesting alternative,
-allowing for the implemention of long-running "business transactions" which require multiple, separate services to agree on either applying or aborting a set of data changes.
+allowing for the implementation of long-running "business transactions" which require multiple, separate services to agree on either applying or aborting a set of data changes.
 
 Of course we should aspire for a service cut which doesn't require interaction with remote services in the first place.
 For instance, it might be an option to move the credit limit logic from the example to the _order_ service itself, avoiding the coordination with the _customer_ service.
@@ -492,7 +502,7 @@ But depending on business requirements, the need for such interaction spanning m
 in particular when it comes to integrating legacy systems, or systems which are not under our control.
 
 Compared to synchronous communication e.g. via HTTP, implementing the Saga flow using messaging infrastructure like Apache Kafka allows the participants to be nicely decoupled.
-If for instance the _payment_ service isn't up an running when the _order_ service receives a new purchase order,
+If for instance the _payment_ service isn't up and running when the _order_ service receives a new purchase order,
 this doesn't matter at all.
 The same goes for Kafka or Debezium, the only resource required synchronously by the _order_ service is its own database.
 Once components come back up again, they will pick up from the last committed offset and continue the data flow.
@@ -518,10 +528,15 @@ It's organized into two parts:
 Going forward, we might extract the former part into a reusable component,
 e.g. provided through the existing Debezium Quarkus extension.
 If there is interest in this, please let us know by commenting below or by reaching out on the mailing list.
-While the implementation works reliably, some improvements to the API might be in order in this case;
-also there should be thingsl ike monitoring sagas who haven't been completed after some time.
+While the current implementation works reliably, some features should be added;
+for instance it may be desirable to optionally execute multiple saga steps concurrently.
+Whether that's reasonable or not, is a business decision (e.g. in the example discussed in this post it arguably makes sense to only trigger the credit card payment once the customer credit limit check has successfully completed),
+but supporting it would be trivial from a technical perspective.
+Contention while updating the saga state may become a critical issue in this case;
+the post https://particular.net/blog/optimizations-to-scatter-gather-sagas["Optimizations to scatter-gather sagas"] discusses potential solutions for this.
+Another capability to add would be a facility for monitoring and identifying sagas who haven't been completed after some time.
 
-The proposed implemenation provides means of reliably executing business transactions with "all or nothing" semantics across a span of multiple services.
+The proposed implementation provides means of reliably executing business transactions with "all or nothing" semantics across a span of multiple services.
 For more advanced use cases, e.g. including conditional flows, you might take a look at existing workflow engines and business process automation tools,
 such as https://kogito.kie.org/[Kogito].
 Another interesting technology to keep an eye on is the MicroProfile specification for long-running activities (LRA), which currently is under development.
@@ -529,6 +544,4 @@ The MicroProfile community also is discussing https://github.com/eclipse/micropr
 
 == TODO
 
-- parallelization (business decision)
-- how to deal with writes on pending objects
 - systems must offer compensation facility
