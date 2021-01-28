@@ -219,18 +219,13 @@ which will be discussed in more depth further below.
 The "framework" part of the _order_ service's implementation keeps track of the current state of the saga execution within the `sagastate` table,
 whose schema looks like this:
 
-[source]
-----
-Column      |     Type      | Modifiers
-------------+---------------+------------
-id          | uuid          | not null
-currentStep | varchar(2000) |
-payload     | varchar(2000) |
-status      | varchar(2000) |
-stepState   | varchar(2000) |
-type        | varchar(2000) |
-version     | int4          | not null
-----
+[.centered-image.responsive-image]
+====
+++++
+<img src="/assets/images/saga/saga-state-table.png" style="max-width:90%;" class="responsive-image" alt="Schema of the saga state table">
+++++
+*Figure 6. Schema of the saga state table*
+====
 
 Its columns are these:
 
@@ -475,7 +470,7 @@ TODO: add step markers from earlier chart
 ++++
 <img src="/assets/images/saga/open-tracing.png" style="max-width:90%;" class="responsive-image" alt="Saga flow in the Jaeger UI">
 ++++
-*Figure 6. Saga flow in the Jaeger UI*
+*Figure 7. Saga flow in the Jaeger UI*
 ====
 
 The visualization flow in Jaeger nicely shows how the saga flow is triggered by the incoming REST request in the _order_ service,
