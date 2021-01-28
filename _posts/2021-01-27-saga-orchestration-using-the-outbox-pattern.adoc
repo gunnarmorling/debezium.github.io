@@ -181,12 +181,12 @@ there'd be additional pairs of request and response messages for each step to be
 [NOTE]
 .Ordering Guarantees
 ====
-For scaling purposes, Kafka topics can be organized into multiple partitions.
+For scaling purposes, Kafka topics can be organized into https://kafka.apache.org/documentation/#intro_concepts_and_terms[multiple partitions].
 
 Only within a partition it is guaranteed that a consumer will receive the messages in exactly the same order as they have been sent by the producer.
 As by default all messages with the same key will go into one and the same partition,
-the unique id of a saga is used as the message key.
-That way, the correct order of processing of the messages pertaining to one saga instance is guaranteed.
+the unique id of a saga is a natural choice for the Kafka message key.
+That way, the correct order of processing of the messages pertaining to one saga instance is esnsured.
 
 Several saga instances can be processed in parallel if they end up in different partitions of the topics used for the saga message exchange.
 ====
@@ -204,15 +204,18 @@ in order to better understand how messages flow between the different saga parti
 *Figure 4. Execution sequence of a successful saga flow*
 ====
 
-Each service emits outgoing messages via its local outbox table.
+Each service emits outgoing messages via the outbox table in its own database.
 From there, the messages are captured via Debezium and sent to Kafka, and finally consumed by the receiving service.
+Upon sending and receiving messages, the _order_ service, acting as the orchestrator, also persists the saga progress in a local state table
+(more on that below).
+Furthermore, all participants log the ids of the messages they've consumed in a journal table, so to identify potential duplicates later on.
 
 Now, what happens if one step of the flow is failing?
 For instance let's assume the payment step fails, as the customer's credit card has expired.
 In that case, the previously reserved credit amount in the _customer_ service needs to be released again.
 To do so, the _order_ service sends a compensation request to the _customer_ service.
 Zooming out a bit (as the details around Debezium and Kafka are the same as before),
-this is how the message exchange would look like:
+this is how the message exchange would look like in this case:
 
 [.centered-image.responsive-image]
 ====
@@ -222,8 +225,8 @@ this is how the message exchange would look like:
 *Figure 5. Execution sequence of a saga flow with compensation*
 ====
 
-Having discussed the message flow _between_ services, let's now dive into some implementation details, starting with the _order_ service.
-The example implementation provides a generic saga orchestrator in form of a simple state machine and the order-specific saga implementation,
+Having discussed the message flow _between_ services, let's now dive into some implementation details of the _order_ service.
+The proof-of-concept implementation provides a generic saga orchestrator in form of a simple state machine and the order-specific saga implementation,
 which will be discussed in more depth further below.
 The "framework" part of the _order_ service's implementation keeps track of the current state of the saga execution within the `sagastate` table,
 whose schema looks like this:
@@ -240,7 +243,7 @@ Its columns are these:
 
 * `id`: Unique identifier of a given saga instance, representing the creation of one particular purchase order
 * `currentStep`: The step at which the saga currently is, e.g. "credit-approval" or "payment"
-* `payload`: An arbitrary data structure associated with a particular saga instance, e.g. containing the id or corresponding purchase order and other information useful during the saga lifecycle
+* `payload`: An arbitrary data structure associated with a particular saga instance, e.g. containing the id of the corresponding purchase order and other information useful during the saga lifecycle
 * `status`: The current status of the saga; one of `STARTED`, `SUCCEEDED`, `ABORTING`, or `ABORTED`
 * `stepState`: A string-ified JSON structure describing the status of the individual steps, e.g. `"{\"credit-approval\":\"SUCCEEDED\",\"payment\":\"STARTED\"}"`
 * `type`: A nominal type of a saga, e.g. "order-placement"; useful to tell apart different kinds of sagas supported by one system
@@ -321,16 +324,17 @@ Once that has succeeded, the saga is in its final state, `ABORTED`:
   "currentstep": "credit-approval",
   "payload": "{\"order-id\":2,\"customer-id\":456, ...}",
   "status": "ABORTED",
-  "stepstate": "{\"credit-approval\":\"ABORTED\",\"payment\":\"ABORTED\"}",
+  "stepstate": "{\"credit-approval\":\"ABORTED\",\"payment\":\"FAILED\"}",
   "type": "order-placement",
   "version": 4
 }
 ----
 
-You can try out things yourself by following instructions in the example's README file,
-where you'll find requests for placing successful as well as failing order creations.
+You can try out things yourself by following https://github.com/debezium/debezium-examples/tree/master/saga#running-the-example[the instructions] in the example's README file,
+where you'll find requests for placing https://github.com/debezium/debezium-examples/blob/master/saga/requests/place-order.json[successful] as well as https://github.com/debezium/debezium-examples/blob/master/saga/requests/place-invalid-order2.json[failing] order creations.
 It also has instructions for examining the exchanged messages in the Kafka topics sourced from the outbox tables of the different services.
 
+Now let's look into some parts of the use case specific implementation.
 The saga flow gets started within the _order_ service's REST endpoint implementation like so:
 
 [source,java]
@@ -350,15 +354,14 @@ public PlaceOrderResponse placeOrder(PlaceOrderRequest req) {
 <2> Begin the order placement saga flow for the incoming order
 
 `SagaManager#begin()` will create a new record in the `sagastate` table, obtain the first outbox event from the `OrderPlacementSaga` implementation and persist it in the outbox table.
-
-`OrderPlacementSaga` implements all the use case specific parts of the saga flow:
+The `OrderPlacementSaga` class implements all the use case specific parts of the saga flow:
 
 * outbox events to be sent for executing one part of the saga flow
 * outbox events for compensating one part of the saga flow
 * event handlers for processing reply messages from the othe saga participants
 
 The `OrderPlacementSaga` implementation is a tad too long for showing it here in its entirety
-(you can find its complete source here on GitHub),
+(you can find its https://github.com/debezium/debezium-examples/blob/master/saga/order-service/src/main/java/io/debezium/examples/saga/order/saga/OrderPlacementSaga.java[complete source] on GitHub),
 but here are some key parts:
 
 [source,java]
@@ -436,26 +439,24 @@ this.outboxEvent.fire(CreditEvent.of(sagaId, CreditStatus.CANCELLED));
 ...
 ----
 
-Each service also has a journal table with the ids of consumed messages,
-allowing to identify and exclude duplicated messages after an un-clean connector shutdown.
-
-The implementation of the _customer_ and _payment_ services isn't anything fundamentally now,
+The implementation of the _customer_ and _payment_ services isn't anything fundamentally new,
 so they are omitted here for the sake of brevity.
-You can find their complete source code here.
+You can find their complete source code https://github.com/debezium/debezium-examples/tree/master/saga/customer-service[here] and https://github.com/debezium/debezium-examples/tree/master/saga/payment-service[here].
 
 == When Things Go Wrong
 
 A key part of implementing distributed interaction patterns like sagas is understanding how they behave in failure scenarios and making sure that (eventual) consistency is also achieved under such unforeseen circumstances.
 
-Note that a negative outcome by any of the saga participants (e.g. if the _payment_ service rejects the payment due to an invalid credit card) is not a failure scenario here;
+Note that a negative outcome of any of the saga steps
+(e.g. if the _payment_ service rejects the payment due to an invalid credit card) is not a failure scenario here;
 it is explicitly expected that participants cannot successfully execute their part of the overall flow,
 resulting in the execution of appropriate compensating local transactions.
 This also means that such generally anticipated failure of execution must not result in a rollback of the local database transaction,
 as otherwise no reply message would be sent back to the orchestrator via the outbox.
 
-With that in mind, let's discuss some actual failure scenarios:
+With that in mind, let's discuss some possible failure scenarios:
 
-The event handler of a Kafka message raises an exception:: the local database transaction will be rolled back and the incoming Kafka message will not be acknowledged with the broker; depending on the kind of exception, it may be retried after some time. In any case, monitoring should be in place to detect this situation, as the saga flow won't be able to continue until the message has been processed
+The event handler of a Kafka message raises an exception:: The local database transaction will be rolled back and the incoming Kafka message will not be acknowledged with the broker; depending on the kind of exception, it may be retried after some time. In any case, monitoring should be in place to detect this situation, as the saga flow won't be able to continue until the message has been processed
 The Debezium connector crashes after sending an outbox message to Kafka, but before committing the offset in the source database's transaction log:: After restarting the connector, it will continue to read the messages from the outbox table beginning at the log offset that was committed last, potentially resulting in some outbox events sent a second time; that's why all the participants need to be idempotent, as implemented in the example by means of journal tables which allow to detect if the same event is processed a second time
 The Kafka broker isn't running or cannot be reached, e.g. due to a network split:: The Debezium connectors can resume their work once Kafka is available and accessable again; until then, saga flows naturally cannot proceed
 A message gets processed, but acknowledging it with Kafka fails:: The message will be passed to the consuming service again, which would find the message's id in its journal table and thus ignore the duplicated message
@@ -469,8 +470,10 @@ We could discuss some more cases, but the general semantics of the overall desig
 When designing an event flow between distributed systems, operational insight is a key aspect of making sure everything runs correctly and efficiently.
 Distributed tracing helps with that by collecting trace information from the individual systems that contribute to such interaction and allowing to examine the call flows e.g. in a web UI.
 
-Debezium's outbox support addresses this concern through tight integration with the OpenTracing spec (support for OpenTelemetry is on the roadmap).
-By putting a tool such Jaeger into place, it's just a matter of configuration to collect trace information from the _order_, _customer_, and _payment_ services and display the end-to-end spans.
+Debezium's outbox support addresses this concern through tight integration with the https://opentracing.io/[OpenTracing] spec
+(support for https://opentelemetry.io/[OpenTelemetry] is on the roadmap).
+By putting a tool such jaegertracing.io[Jaeger into place],
+it's just a link:/documentation/reference/integrations/tracing.html[matter of configuration] to collect trace information from the _order_, _customer_, and _payment_ services and display the end-to-end spans.
 
 TODO: add step markers from earlier chart
 
@@ -485,22 +488,24 @@ TODO: add step markers from earlier chart
 The visualization flow in Jaeger nicely shows how the saga flow is triggered by the incoming REST request in the _order_ service,
 an outbox message is sent to _customer_ and back to _order_,
 followed by another one sent to _payment_ and back to _order_.
+
 The tracing functionality makes it rather easy to identify unfinished flows
 -- e.g. because an event handler in one of the participating services fails to process a message --
 as well as performance bottlenecks,
-e.g. one event handler taking particularly long for fulfilling its part of the saga flow.
+e.g. one event handler taking unreasonably long for fulfilling its part of the saga flow.
 
-== Wrap-Up
+== Wrap-Up and Outlook
 
 Distributed transaction protocols like XA used to be a popular choice for applying changes to a set of databases.
 Within microservices architectures, this typically isn't an option, though.
-Services may use non-XA compatible data stores internally,
+Database specifics aren't present at the service level,
+services may use non-XA compatible data stores internally;
 also Apache Kafka -- as a popular infrastructure for message exchange between microservices -- doesn't support integration with XA transaction managers.
 
-The saga pattern presents itself as a very interesting alternative,
+The saga pattern presents itself as a powerful and flexible alternative,
 allowing for the implementation of long-running "business transactions" which require multiple, separate services to agree on either applying or aborting a set of data changes.
 
-Of course we should aspire for a service cut which doesn't require interaction with remote services in the first place.
+Of course we should aspire for a service cut which reduces the need for interaction with remote services as much as possible.
 For instance, it might be an option to move the credit limit logic from the example to the _order_ service itself, avoiding the coordination with the _customer_ service.
 But depending on business requirements, the need for such interaction spanning multiple services may be impossible to avoid,
 in particular when it comes to integrating legacy systems, or systems which are not under our control.
@@ -510,18 +515,21 @@ If for instance the _payment_ service isn't up and running when the _order_ serv
 this doesn't matter at all.
 The same goes for Kafka or Debezium, the only resource required synchronously by the _order_ service is its own database.
 Once components come back up again, they will pick up from the last committed offset and continue the data flow.
+
 We could try and wrap a resiliency layer around an architecture based on synchronous communication,
 e.g. employing patterns like retries and circuit breakers.
 But things would become very complex quickly: For how long to retry?
 Where to buffer requests safely if an invoked service isn't available?
 An asynchronous architecture based on messaging infrastructure like Apache Kafka provides the required decoupling between systems out of the box and should be the preferred approach.
-Instead of doing dual writes to a service's database _and_ Kafka,
-the outbox pattern implemented via CDC and Debezium provides a safe way for keeping these resources in sync.
+
+Also with Kafka in the picture, there is a risk of potentially unsafe dual to a service's database _and_ Kafka.
+This can be circumvented via the outbox pattern,
+which -- implemented via CDC and Debezium -- provides a safe way for keeping these resources in sync.
 
 When implementing complex patterns like sagas,
 it's vital to exactly understand their constraints and semantics.
 Two things to be aware of in the context of the proposed solution are the inherent eventual consistency and the limited isolation level of the overarching business transaction.
-For instance the allocation of parts of the customer's credit limit may cause another, concurrently submitted order by that customer, to be rejected, also if this first order eventually also would be rejected, e.g. due to a failure with its payment.
+For instance the allocation of parts of the customer's credit limit may cause another, concurrently submitted order by that customer, to be rejected, also if this first order eventually would be rejected, e.g. due to a failure with its payment.
 
 The example project discussed in this post provides a PoC-level implementation for saga orchestration based on CDC and the outbox pattern.
 It's organized into two parts:
@@ -531,11 +539,11 @@ It's organized into two parts:
 
 Going forward, we might extract the former part into a reusable component,
 e.g. provided through the existing Debezium Quarkus extension.
-If there is interest in this, please let us know by commenting below or by reaching out on the mailing list.
+If there is interest in this, please let us know by commenting below, or by reaching out on the mailing list.
 While the current implementation works reliably, some features should be added;
 for instance it may be desirable to optionally execute multiple saga steps concurrently.
 Whether that's reasonable or not, is a business decision (e.g. in the example discussed in this post it arguably makes sense to only trigger the credit card payment once the customer credit limit check has successfully completed),
-but supporting it would be trivial from a technical perspective.
+but supporting it wouldn't be hard from a technical perspective.
 Contention while updating the saga state may become a critical issue in this case;
 the post https://particular.net/blog/optimizations-to-scatter-gather-sagas["Optimizations to scatter-gather sagas"] discusses potential solutions for this.
 Another capability to add would be a facility for monitoring and identifying sagas who haven't been completed after some time.
@@ -543,7 +551,8 @@ Another capability to add would be a facility for monitoring and identifying sag
 The proposed implementation provides means of reliably executing business transactions with "all or nothing" semantics across a span of multiple services.
 For more advanced use cases, e.g. including conditional flows, you might take a look at existing workflow engines and business process automation tools,
 such as https://kogito.kie.org/[Kogito].
-Another interesting technology to keep an eye on is the MicroProfile specification for long-running activities (LRA), which currently is under development.
+Another interesting technology to keep an eye on is the MicroProfile https://github.com/eclipse/microprofile-lra[specification for long-running activities] (LRA),
+which currently is under development.
 The MicroProfile community also is discussing https://github.com/eclipse/microprofile-lra/issues/338[the integration with transactional outbox implementations] like Debezium's.
 
 == TODO
