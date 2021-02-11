@@ -6,6 +6,16 @@ tags: [ discussion, patterns, outbox ]
 author: gmorling
 ---
 
+== Key Takeaways
+
+* Sagas allow for the implementation of long-running, distributed business transactions,
+executing a set of operations across multiple microservices, applying consistent all-or-nothing semantics
+* For the sake of decoupling, communication between microservices should preferably happen asynchronously,
+for instance using distributed commit logs like Apache Kafka
+* The outbox pattern provides a solution for service authors to perform writes to their local database and send messages via Apache Kafka,
+without relying on unsafe "dual writes"
+* https://debezium.io/[Debezium], a distributed open-source change data capture platform, provides a robust and flexible foundation for orchestrating Saga flows using the outbox pattern
+
 When moving to microservices, one of the first things to realize is that individual services don't exist in isolation.
 While the goal is to create loosely coupled, independent services with as little interaction as possible,
 chances are high that one service needs a particular data set owned by another service,
@@ -15,9 +25,10 @@ The outbox pattern, link:/blog/2019/02/19/reliable-microservices-data-exchange-w
 Avoiding any unsafe "dual writes" to multiple resources, e.g. a database and a message broker,
 the outbox pattern achieves eventually consistent data exchange,
 without depending on the synchronous availability of all participants,
-and not requiring distributed transaction protocols such as XA either.
+and not requiring complex protocols such as XA
+(a widely https://pubs.opengroup.org/onlinepubs/009680699/toc.pdf[used standard] for distributed transaction processing defined by https://www.opengroup.org/[The Open Group]) either.
 
-In this post I'd like to explore how to take the outbox pattern to the next level and use it for implementing _Sagas_,
+In this article I'd like to explore how to take the outbox pattern to the next level and use it for implementing _Sagas_,
 potentially long-running business transactions which span across multiple microservices.
 One common example is that of booking a travel comprising multiple parts: either all flight legs and accommodation should be booked together, or none of them.
 Sagas split up one such overarching business transaction into a series of multiple local database transactions,
@@ -25,14 +36,19 @@ which are executed by the participating services.
 
 +++<!-- more -->+++
 
+== A Primer on Sagas
+
 For "rolling back" the overarching business transaction in case of a failure,
 Sagas rely on the notion of _compensating transactions_:
 each previously applied local transaction must be able to be "undone" by running another transaction which applies the inversion of the formerly done changes.
-Sagas are by no means a new concept, they have first been discussed by Hector Garcia-Molina and Kenneth  Salem in their SIGMOD '87 https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf[Sagas] paper.
-But as distributed transactions typically are not an option in microservices architectures,
+
+Sagas are https://www.infoq.com/articles/History-of-Extended-Transactions/[by no means] a new concept, they have first been discussed by Hector Garcia-Molina and Kenneth  Salem in their SIGMOD '87 https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf[Sagas] paper.
+But in the context of the continuing move towards building,
 Sagas backed by local transactions within the participating services are seeing growing popularity these days,
 as for instance indicated by the https://github.com/eclipse/microprofile-lra[MicroProfile specification for Long Running Actions],
 which is currently under active development.
+Sagas lend themselves in particular to the implementation of transactional flows taking a longer period of time,
+which typically https://www.theserverside.com/news/1365143/ACID-is-Good-Take-it-in-Short-Doses[cannot be addressed] with ACID semantics.
 
 To make things tangible, let's consider the example of an e-commerce business with three services, _order_, _customer_, and _payment_.
 When a new purchase order is submitted to the _order_ service,
@@ -51,7 +67,7 @@ First, we need to check with the _customer_ service whether the incoming order f
 So if for instance the customer has a credit limit of $500, and a new order with a value of $300 comes in,
 then this order would fit into the current limit, with a remaining limit of $200.
 A subsequent order with a value of $250 would be rejected accordingly,
-as it would pass the customer's then current open credit limit.
+as it would exceed the customer's then current open credit limit.
 
 If the credit limit check succeeds,
 the payment for the order needs to be requested via the _payment_ service.
@@ -62,7 +78,7 @@ If the credit limit check fails though,
 the order will go to the `Rejected` state right away.
 If that step succeeds but then the subsequent payment request fails,
 the previously allocated credit limit needs to be released again,
-before transitioning to the `rejected` state.
+before transitioning to the `Rejected` state.
 
 == Implementation Choices
 
@@ -73,16 +89,19 @@ With orchestration on the other hand, there's one coordinating service, which in
 Both approaches have their pros and cons, e.g. see https://chrisrichardson.net/post/sagas/2019/08/04/developing-sagas-part-2.html[this post] by Chris Richardson and https://medium.com/@ydorego/microservices-orchestration-vs-choreography-the-eternal-saga-d58c35e07d81[this one] by Yves do Régo for a more detailed discussion.
 Personally, I'm preferring the orchestration approach, as it defines one central place which can be queried to obtain the current status of a particular Saga (the orchestrator, or "Saga execution coordinator", SEC for short).
 As it avoids point-to-point communication between participants (other than the orchestrator),
-it also allows for the addition of further intermediary steps between two participants of the flow,
-without the need to adjust them.
+it also allows for the addition of further intermediary steps within the flow,
+without the need to adjust each participant.
+
 
 Before diving into the implementation of such Saga flow,
-it's worth spending some time to think about the transactional semantics it provides.
-So let's examine how Sagas satisfy the four classic ACID properties of transactions:
+it's worth spending some time to think about the transactional semantics which Sagas provide.
+So let's examine how Sagas satisfy the four classic ACID properties of transactions,
+as defined by Theo Härder and Andreas Reuter (based on http://jimgray.azurewebsites.net/papers/thetransactionconcept.pdf[earlier work] by Jim Gray) in their fundamental paper https://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.115.8124["Principles of Transaction-Oriented Database Recovery"]:
 
 * _**A** tomicity_: ✅ -- The pattern ensures that either all services apply the local transactions,
 or, in case of a failure, all already executed local transactions are compensated, so that no data change is applied effectively
-* _**C** onsistency_: ✅ -- All local constraints are guaranteed to be satisfied after successful execution of all the transactions making up the Saga
+* _**C** onsistency_: ✅ -- All local constraints are guaranteed to be satisfied after successful execution of all the transactions making up the Saga,
+ transitioning the overall system from one consistent state to another
 * _**I** solation_: ❌ -- As local transactions are committed as the Saga is running, their changes are already visible to other concurrent transactions, despite the possibility that the Saga will fail eventually,
 causing all previously applied transactions to be compensated. I.e. from the perspective of the overall Saga, the isolation level is comparable to "read uncommitted"
 * _**D** urability_: ✅ -- Once the local transactions of the Saga have been committed, their changes are persisted and durable e.g. after a service failure and restart
@@ -94,20 +113,14 @@ as per the logic of the different participating services.
 As far as the communication between the participating services is concerned,
 this may happen either synchronously, e.g. via HTTP or https://grpc.io/[gRPC],
 or asynchronously, e.g. via message brokers or distributed logs such as https://kafka.apache.org/[Apache Kafka].
-While the former often is a popular choice due to its perceived simplicity,
-synchronous communication in distributed systems comes with quite a few disadvantages.
-A step in the Saga flow will only complete if the target service is available at this point in time.
-While techniques like buffering or retrying requests may help, they are not without their own complexities.
-For instance the _order_ service would have to take care of persisting outgoing HTTP requests,
-so to make sure it can return control back to the caller also if one of the other participating services temporarily isn't available.
-
-An asynchronous implementation e.g. via Kafka avoids these issues,
-as the availability of consuming services doesn't impact the sending service,
-and as we'll see in the next section, not even the availability of Kafka itself is a concern, thanks to change data capture.
+Whenever possible, asynchronous communication between services should be preferred,
+as it unties the sending service from the availability of consuming ones.
+And as we'll see in the next section, not even the availability of Kafka itself is a concern,
+thanks to change data capture.
 
 == Recap: The Outbox Pattern
 
-Now, how do the outbox pattern and change data capture (via Debezium, of course) fit into all this?
+Now, how do the outbox pattern and change data capture (as for instance provided by https://debezium.io[Debezium]) fit into all this?
 As said above, a Saga coordinator should preferably communicate asynchronously with participating services,
 via request and reply message channels.
 Apache Kafka is a super-popular choice for implementing these channels.
@@ -128,22 +141,19 @@ and the outbox pattern provides a very elegant way for addressing this issue:
 ====
 
 Instead of directly sending a message to Kafka when updating the database,
-the service inserts the message into a specific _outbox table_ within its database.
-This happens within a single transaction, so either the changes to the service's model are persisted _and_ the message gets safely stored in the outbox table,
+the service uses a single transaction to both perform the normal update and also insert the message into a specific _outbox table_ within its database.
+Because this is done within a single database transaction,
+either the changes to the service's model are persisted _and_ the message gets safely stored in the outbox table,
 or _none_ of these changes gets applied.
 Once the transaction has been written to the database's transaction log,
 the Debezium change data capture process can pick up the outbox message from there and send it to Apache Kafka.
 
-This is done using _at-least-once_ semantics, i.e. it might happen the same outbox message is sent to Kafka multiple times.
-This would happen in case of failures such as a crash of Debezium,
-where it didn't get to persist its offset, i.e. the last log position it has read.
-After a restart, it would then continue to read the transaction log from the last persisted offset position,
-resulting in messages after that offset potentially being sent a second time.
-In order to allow consumers to detect and ignore duplicated messages,
+This is done using _at-least-once_ semantics:
+under specific circumstances, the same outbox message could be sent to Kafka multiple times.
+In order to allow consumers to detect and ignore duplicate messages,
 each message should have a unique id.
-This could for instance be a UUID or a monotonically increasing sequence specific to each message producer.
-Propagating that id as a Kafka message header allows for very efficient examination and potential discarding on the consumer side,
-before deserializing the actual message payload.
+This could for instance be a UUID or a monotonically increasing sequence specific to each message producer,
+propagated as a Kafka message header.
 
 == Implementing Sagas Using the Outbox Pattern
 
@@ -168,13 +178,17 @@ The overall solution design looks like this:
 You can find a complete proof-of-concept implementation of this architecture in the Debezium https://github.com/debezium/debezium-examples/tree/master/saga[examples repository] on GitHub.
 The key parts of the architecture are these:
 
-* The three services, _order_ (for managing purchase orders and acting as the Saga orchestrator), _customer_ (for managing the customer's credit limit), and _payment_ (for handling credit card payments), each with their own local database (Postgres)
+* The three services, _https://github.com/debezium/debezium-examples/tree/master/saga/order-service[order]_ (for managing purchase orders and acting as the Saga orchestrator),
+_https://github.com/debezium/debezium-examples/tree/master/saga/customer-service[customer]_ (for managing the customer's credit limit),
+and _https://github.com/debezium/debezium-examples/tree/master/saga/payment-service[payment]_ (for handling credit card payments), each with their own local database (Postgres)
 * Apache Kafka as the messaging backbone
 * Debezium, running on top of Kafka Connect, subscribing to changes in the three different databases, and sending them to corresponding Kafka topics, using Debezium's link:/documentation/reference/configuration/outbox-event-router.html[outbox event routing] component
 
 The three services are implemented using https://quarkus.io/[Quarkus], a stack for building cloud-native microservices either running on the JVM,
 or compiled down to native binaries (via GraalVM).
-Of course, the pattern could also be implemented using other stacks or even languages.
+Of course, the pattern could also be implemented using other stacks or languages,
+as long as they provide means of consuming messages from Kafka and writing to a database.
+Also a combination of different implementation technologies is possible.
 
 There are four Kafka topics involved: a request and a response topic for the credit approval messages, and a request and a response topic for the payment messages.
 In case of a successful Saga execution, exactly four messages would be exchanged.
@@ -197,7 +211,7 @@ Several Saga instances can be processed in parallel if they end up in different 
 Inspired by architecture documentation templates such as https://arc42.org/download[arc42],
 let's switch perspectives and take a look at the _runtime view_ of the solution,
 in order to better understand how messages flow between the different Saga participants in case of a successful Saga execution
-(and yes, I got carried away a bit drawing diagrams using https://excalidraw.com/[Excalidraw] while writing this post ;):
+(and yes, I got carried away a bit drawing diagrams using https://excalidraw.com/[Excalidraw] while writing this article ;):
 
 [.centered-image.responsive-image]
 ====
@@ -250,7 +264,7 @@ Its columns are these:
 * `status`: The current status of the Saga; one of `STARTED`, `SUCCEEDED`, `ABORTING`, or `ABORTED`
 * `stepState`: A string-ified JSON structure describing the status of the individual steps, e.g. `"{\"credit-approval\":\"SUCCEEDED\",\"payment\":\"STARTED\"}"`
 * `type`: A nominal type of a Saga, e.g. "order-placement"; useful to tell apart different kinds of Sagas supported by one system
-* `version`: An optimistic locking version, used to detect and reject concurrent updates to one Saga instance (in which case the message triggering the failing update needs to be retried, re-loading the current state from the Saga log)
+* `version`: An optimistic locking version, used to detect and reject concurrent updates to one Saga instance (in which case the message triggering the failing update needs to be retried, reloading the current state from the Saga log)
 
 As the _order_ service sends requests to the _customer_ and _payment_ services and receives their replies from Kafka,
 the Saga state gets updated within this table.
@@ -356,12 +370,13 @@ public PlaceOrderResponse placeOrder(PlaceOrderRequest req) {
 <1> Persist the incoming purchase order
 <2> Begin the order placement Saga flow for the incoming order
 
-`SagaManager#begin()` will create a new record in the `sagastate` table, obtain the first outbox event from the `OrderPlacementSaga` implementation and persist it in the outbox table.
+`SagaManager.begin()` will create a new record in the `sagastate` table, obtain the first outbox event from the `OrderPlacementSaga` implementation,
+and persist it in the outbox table.
 The `OrderPlacementSaga` class implements all the use case specific parts of the Saga flow:
 
 * outbox events to be sent for executing one part of the Saga flow
 * outbox events for compensating one part of the Saga flow
-* event handlers for processing reply messages from the othe Saga participants
+* event handlers for processing reply messages from the other Saga participants
 
 The `OrderPlacementSaga` implementation is a tad too long for showing it here in its entirety
 (you can find its https://github.com/debezium/debezium-examples/blob/master/saga/order-service/src/main/java/io/debezium/examples/saga/order/saga/OrderPlacementSaga.java[complete source] on GitHub),
@@ -432,7 +447,7 @@ which depending on the status may either complete the Saga or initiate its rollb
 <6> Updates the purchase order status, based on the current Saga states
 
 To simplify interactions with the respective outbox tables, the three services use Debezium's link:/documentation/reference/integrations/outbox.html[Quarkus extension] for persisting outbox messages.
-Using this extension outbox events can be emitted by firing CDI events,
+Using this extension outbox events can be emitted by firing https://jakarta.ee/specifications/cdi/3.0/jakarta-cdi-spec-3.0.html#events[CDI events],
 whose payload is persisted in the outbox table as part of the ongoing local database transaction:
 
 [source,java]
@@ -459,8 +474,8 @@ as otherwise no reply message would be sent back to the orchestrator via the out
 
 With that in mind, let's discuss some possible failure scenarios:
 
-The event handler of a Kafka message raises an exception:: The local database transaction is rolled back and the message consumer does not acknowledge to the Kafka broker that it was able to process the message;  Because the broker receives no confirmation that the message was processed, after some time it will resend the message repeatedly, until it gets acknowledged. You should have monitoring in place to detect such a situation, because the Saga flow won’t be able to continue until the message has been processed.
-The Debezium connector crashes after sending an outbox message to Kafka, but before committing the offset in the source database's transaction log:: After restarting the connector, it will continue to read the messages from the outbox table beginning at the log offset that was committed last, potentially resulting in some outbox events sent a second time; that’s why all the participants need to be idempotent, as implemented in the example by means of journal tables which enable detection of events that are processed more than once.
+The event handler of a Kafka message raises an exception:: The local database transaction is rolled back and the message consumer does not acknowledge to the Kafka broker that it was able to process the message;  Because the broker receives no confirmation that the message was processed, after some time it will resend the message repeatedly, until it gets acknowledged. You should have monitoring in place to detect such a situation, because the Saga flow won't be able to continue until the message has been processed.
+The Debezium connector crashes after sending an outbox message to Kafka, but before committing the offset in the source database's transaction log:: After restarting the connector, it will continue to read the messages from the outbox table beginning at the log offset that was committed last, potentially resulting in some outbox events sent a second time; that's why all the participants need to be idempotent, as implemented in the example by means of unique message ids and consumers tracking successfully processed messages via the journal tables.
 The Kafka broker isn't running or cannot be reached, for example, due to a network split:: The Debezium connectors can resume their work after Kafka is available and accessible again; until then, Saga flows naturally cannot proceed.
 A message gets processed, but acknowledging it with Kafka fails:: The message will be passed to the consuming service again, which would find the message's id in its journal table and thus ignore the duplicated message.
 Concurrent updates to the Saga state table when processing multiple Saga steps in parallel:: While we've discussed a sequential flow with the orchestrator triggering participating services one after another, one might also envision a Saga implementation which processes multiple steps in parallel. In this case,
@@ -476,9 +491,7 @@ Distributed tracing provides such insights by collecting trace information from 
 Debezium's outbox support addresses this concern through tight integration with the https://opentracing.io/[OpenTracing] spec
 (support for https://opentelemetry.io/[OpenTelemetry] is on the roadmap).
 By putting a tool such as https://jaegertracing.io[Jaeger] into place,
-it's just a link:/documentation/reference/integrations/tracing.html[matter of configuration] to collect trace information from the _order_, _customer_, and _payment_ services and display the end-to-end spans.
-
-TODO: add step markers from earlier chart
+it's just a link:/documentation/reference/integrations/tracing.html[matter of configuration] to collect trace information from the _order_, _customer_, and _payment_ services and display the end-to-end traces.
 
 [.centered-image.responsive-image]
 ====
@@ -488,9 +501,9 @@ TODO: add step markers from earlier chart
 *Figure 7. Saga flow in the Jaeger UI*
 ====
 
-The visualization flow in Jaeger nicely shows how the Saga flow is triggered by the incoming REST request in the _order_ service,
-an outbox message is sent to _customer_ and back to _order_,
-followed by another one sent to _payment_ and back to _order_.
+The visualization in Jaeger nicely shows how the Saga flow is triggered by the incoming REST request in the _order_ service (1),
+an outbox message is sent to _customer_ (2) and back to _order_ (3),
+followed by another one sent to _payment_ (4) and back to _order_ (5).
 
 The tracing functionality makes it rather easy to identify unfinished flows
 —- for example, because an event handler in one of the participating services fails to process a message —-
@@ -499,68 +512,47 @@ such as when one event handler takes unreasonably long to fulfill its part of th
 
 == Wrap-Up and Outlook
 
-Distributed transaction protocols like XA used to be a popular choice for applying changes to a set of databases.
-Within microservices architectures, this typically isn't an option, though.
-Database specifics aren't present at the service level,
-services may use non-XA compatible data stores internally;
-also Apache Kafka -- as a popular infrastructure for message exchange between microservices -- doesn't support integration with XA transaction managers.
-
-The Saga pattern presents itself as a powerful and flexible alternative,
-allowing for the implementation of long-running "business transactions",
+The Saga pattern offers a powerful and flexible solution for implementing long-running "business transactions",
 which require multiple, separate services to agree on either applying or aborting a set of data changes.
 
+Thanks to the outbox pattern — implemented with CDC, Debezium and Apache Kafka —
+the Saga coordinator is decoupled from the availability of any of the other participating services.
+Temporary outages of single participants don't impact the overall Saga flow: once components come back up again, the Saga will continue from the point where it was interrupted before.
+
 Of course we should aspire for a service cut that reduces the need for interaction with remote services as much as possible.
-For instance, it might be an option to move the credit limit logic from the example to the _order_ service itself, avoiding the coordination with the _customer_ service.
-But depending on business requirements, the need for such interaction spanning multiple services might be impossible to avoid,
-in particular when it comes to integrating legacy systems, or systems which are not under our control.
-
-Compared to synchronous communication, for example via HTTP, implementing the Saga flow using messaging infrastructure like Apache Kafka allows the participants to be nicely decoupled.
-If for instance the _payment_ service isn't up and running when the _order_ service receives a new purchase order,
-this doesn't matter at all.
-The same goes for Kafka or Debezium, the only resource required synchronously by the _order_ service is its own database.
-Once components come back up again, they will pick up from the last committed offset and continue the data flow.
-
-We could try and wrap a resiliency layer around an architecture based on synchronous communication,
-for example, employing patterns like retries and circuit breakers.
-But things would become very complex quickly: How long to wait before a retry, how many times to retry?
-Where to buffer requests safely if an invoked service isn't available?
-An asynchronous architecture based on messaging infrastructure like Apache Kafka provides the required decoupling between systems out of the box and should be the preferred approach.
-
-Also with Kafka in the picture, there is a risk of potentially unsafe dual writes to a service's database _and_ Kafka.
-This can be circumvented via the outbox pattern,
-which -- implemented via CDC and Debezium -- provides a safe way for keeping these resources in sync.
+For instance, it might be an option to move the credit limit logic from the example to the order service itself,
+avoiding the coordination with the customer service.
+But depending on business requirements,
+the need for such interaction spanning multiple services might be impossible to avoid,
+in particular when it comes to integrating legacy systems,
+or systems which are not under our control.
 
 When implementing complex patterns like Sagas,
 it's vital to exactly understand their constraints and semantics.
 Two things to be aware of in the context of the proposed solution are the inherent eventual consistency and the limited isolation level of the overarching business transaction.
-For instance, allocating a portion of the customer’s credit limit could cause another order from that customer that was submitted at the same time, to be rejected, also if the first order doesn't go through eventually, due to the failure of the payment.
+For instance, allocating a portion of the customer's credit limit could cause another order from that customer,
+that was submitted at the same time, to be rejected, also if the first order doesn't go through eventually.
 
-The example project discussed in this post provides a PoC-level implementation for Saga orchestration based on CDC and the outbox pattern.
+The example project discussed in this article provides a PoC-level implementation for Saga orchestration based on CDC and the outbox pattern.
 It's organized into two parts:
 
 * A generic "framework" component that provides the Saga orchestration logic in the form of a simple state machine along with the Saga execution log
 * The specific implementation of the discussed order placement use case (the `OrderPlacementSaga` class shown in parts above, accompanying REST endpoints etc.)
 
-Going forward, we might extract the former part into a reusable component,
-for example, through the existing Debezium Quarkus extension.
-If there is interest in this, please let us know by commenting below, or by reaching out on the mailing list.
-While the current implementation works reliably, some features should be added;
-for instance, it might be desirable to optionally execute multiple Saga steps concurrently.
-Whether that’s reasonable or not is a business decision
-(for example, in the example earlier in this post it arguably makes sense to only trigger the credit card payment after the customer credit limit check has successfully completed),
-but supporting it wouldn’t be hard from a technical perspective.
+Going forward, we might extract the former part into a reusable component, for example, through the existing Debezium Quarkus extension. If there is interest in this, please let us know by reaching out on the Debezium https://groups.google.com/g/debezium[mailing list][mailing list].
+One potential feature to add would be means of executing multiple Saga steps concurrently.
+Whether that's reasonable or not is a business decision,
+but supporting it wouldn't be hard from a technical perspective.
 Contention while updating the Saga state may become a critical issue in this case;
 the post https://particular.net/blog/optimizations-to-scatter-gather-sagas["Optimizations to scatter-gather sagas"] discusses potential solutions for this.
-Another capability to add would be a facility for monitoring and identifying Sagas that haven’t been completed after some time.
+It'd also be interesting to have a facility for monitoring and identifying Sagas that haven't been completed after some time.
 
-The proposed implementation provides a means of reliably executing business transactions with "all or nothing" semantics across a span of multiple services.
-For more advanced use cases, such as. including conditional flows, you might take a look at existing workflow engines and business process automation tools, such as https://kogito.kie.org/[Kogito].
+The proposed implementation provides means of reliably executing business transactions with "all or nothing" semantics across a span of multiple services.
+For use cases with more complex requirements, such as flows with conditional logic,
+you might take a look at existing workflow engines and business process automation tools,
+such as https://kogito.kie.org/[Kogito].
 Another interesting technology to keep an eye on is the MicroProfile https://github.com/eclipse/microprofile-lra[specification for long-running activities] (LRA),
 which currently is under development.
-The MicroProfile community also is discussing https://github.com/eclipse/microprofile-lra/issues/338[the integration with transactional outbox implementations] like Debezium’s.
+The MicroProfile community also is discussing https://github.com/eclipse/microprofile-lra/issues/338[the integration with transactional outbox implementations] like Debezium's.
 
-_Many thanks to https://twitter.com/hpgrahsl[Hans-Peter Grahsl] and https://github.com/roldanbob[Bob Roldan] for their extensive feedback while writing this post!_
-
-== TODO
-
-- systems must offer compensation facility
+_Many thanks to https://twitter.com/hpgrahsl[Hans-Peter Grahsl], https://github.com/roldanbob[Bob Roldan], https://twitter.com/nmcl[Mark Little], and Thomas Betts for their extensive feedback while writing this article!_
